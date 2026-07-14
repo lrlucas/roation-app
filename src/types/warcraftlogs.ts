@@ -98,4 +98,23 @@ export interface ReportFight {
   difficulty: number | null;
   kill: boolean | null;
   size: number | null;
+  encounterID?: number;
+  /** Última fase en la que terminó el pull (1-based, según metadatos del reporte). */
+  lastPhase?: number | null;
+  lastPhaseIsIntermission?: boolean | null;
+  /** % de vida restante del jefe al terminar el pull (null en algunos kills). */
+  bossPercentage?: number | null;
+  fightPercentage?: number | null;
+}
+
+export interface ReportPhaseInfo {
+  id: number;
+  name: string;
+  isIntermission: boolean;
+}
+
+export interface ReportEncounterPhases {
+  encounterID: number;
+  separatesWipes: boolean;
+  phases: ReportPhaseInfo[];
 }

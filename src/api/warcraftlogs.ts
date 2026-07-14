@@ -659,7 +659,12 @@ export async function fetchTierReports(params: FetchTierReportsParams): Promise<
   return out;
 }
 
-export async function getReportFights(code: string): Promise<import('../types/warcraftlogs').ReportFight[]> {
+export interface ReportFightsWithPhases {
+  fights: import('../types/warcraftlogs').ReportFight[];
+  phases: import('../types/warcraftlogs').ReportEncounterPhases[];
+}
+
+export async function getReportFightsWithPhases(code: string): Promise<ReportFightsWithPhases> {
   const query = `
     query GetReportFights($code: String!) {
       reportData {
@@ -667,18 +672,41 @@ export async function getReportFights(code: string): Promise<import('../types/wa
           fights(killType: Encounters) {
             id
             name
+            encounterID
             startTime
             endTime
             difficulty
             kill
             size
+            lastPhase
+            lastPhaseIsIntermission
+            bossPercentage
+            fightPercentage
+          }
+          phases {
+            encounterID
+            separatesWipes
+            phases {
+              id
+              name
+              isIntermission
+            }
           }
         }
       }
     }
   `;
   const data = await gql<any>(query, { code });
-  return data.reportData?.report?.fights || [];
+  const report = data.reportData?.report;
+  return {
+    fights: report?.fights || [],
+    phases: report?.phases || [],
+  };
+}
+
+export async function getReportFights(code: string): Promise<import('../types/warcraftlogs').ReportFight[]> {
+  const { fights } = await getReportFightsWithPhases(code);
+  return fights;
 }
 
 export interface FetchPlayerEventsParams {
@@ -691,7 +719,14 @@ export interface FetchPlayerEventsParams {
   /** Pet-targeted buff ids needing a dedicated ability-filtered query (e.g.
    *  Commander of the Dead). Defaults to Commander for backward compatibility. */
   petBuffIds?: number[];
+  /** Midnight Falls Mythic: rastrear el debuff "Glimmering" (mecánica de llevar
+   *  el Dawn Crystal). Añade una query extra de debuffs sobre aliados y trae el
+   *  icono de la habilidad desde masterData. */
+  trackCrystalDebuff?: boolean;
 }
+
+/** Nombre del debuff de la mecánica del Dawn Crystal en Midnight Falls. */
+export const CRYSTAL_DEBUFF_NAME = 'Glimmering';
 
 export interface CombatantInfo {
   /** WoW spec id (252 = Unholy DK). Confirms which spec the log is for. */
@@ -713,6 +748,13 @@ export interface PlayerEventsResponse {
   bossName: string;
   ilvl: number;
   dps: number;
+  /** Transiciones de fase del combate (timestamps absolutos del reporte, ms).
+   *  Vacío si el jefe no tiene fases o el log no las registró. */
+  phaseTransitions: { id: number; startTime: number }[];
+  /** Eventos del debuff Glimmering en el combate (solo si trackCrystalDebuff). */
+  crystalDebuffs: any[];
+  /** Icono/id de Glimmering desde masterData (solo si trackCrystalDebuff). */
+  crystalAbility: { gameID: number; name: string; icon: string } | null;
   combatant: CombatantInfo;
   events: {
     casts: any[];
@@ -777,6 +819,10 @@ export async function fetchPlayerEvents(params: FetchPlayerEventsParams): Promis
             endTime
             name
             encounterID
+            phaseTransitions {
+              id
+              startTime
+            }
           }
           masterData {
             actors {
@@ -785,6 +831,7 @@ export async function fetchPlayerEvents(params: FetchPlayerEventsParams): Promis
               type
               subType
             }
+            ${params.trackCrystalDebuff ? 'abilities { gameID name icon }' : ''}
           }
           summaryTable: table(fightIDs: [$fightID], dataType: Summary)
         }
@@ -843,6 +890,10 @@ export async function fetchPlayerEvents(params: FetchPlayerEventsParams): Promis
   const petBuffIds = params.petBuffIds ?? [COMMANDER_OF_THE_DEAD_BUFF];
   const petBuffId = petBuffIds[0];
   const hasPetBuffs = petBuffIds.length > 0;
+  // Glimmering se filtra por nombre (no conocemos el spell id de antemano).
+  // Es un debuff sobre aliados, así que va sin hostilityType (Friendlies por defecto)
+  // y sin sourceID (lo aplica el jefe); el portador se resuelve por targetID.
+  const crystalFilter = `ability.name = "${CRYSTAL_DEBUFF_NAME}"`;
   // Primera página de cada dataType en una sola query (1 round-trip en el caso
   // común). Cada bloque pide `nextPageTimestamp`; solo los dataTypes que saturan
   // el límite (normalmente DamageDone en AoE) harán llamadas extra de paginación.
@@ -856,6 +907,7 @@ export async function fetchPlayerEvents(params: FetchPlayerEventsParams): Promis
           buffs: events(fightIDs: [$fightID], dataType: Buffs, sourceID: $sourceID, limit: 10000) { data nextPageTimestamp }
           ${hasPetBuffs ? `petBuffs: events(fightIDs: [$fightID], dataType: Buffs, sourceID: $sourceID, abilityID: ${petBuffId}, limit: 10000) { data nextPageTimestamp }` : ''}
           ${hasDebuffs ? `debuffs: events(fightIDs: [$fightID], dataType: Debuffs, hostilityType: Enemies, filterExpression: ${JSON.stringify(debuffFilter)}, limit: 10000) { data nextPageTimestamp }` : ''}
+          ${params.trackCrystalDebuff ? `crystalDebuffs: events(fightIDs: [$fightID], dataType: Debuffs, filterExpression: ${JSON.stringify(crystalFilter)}, limit: 10000) { data nextPageTimestamp }` : ''}
           damage: events(fightIDs: [$fightID], dataType: DamageDone, sourceID: $sourceID, limit: 10000) { data nextPageTimestamp }
           resources: events(fightIDs: [$fightID], dataType: Resources, sourceID: $sourceID, limit: 10000) { data nextPageTimestamp }
           summons: events(fightIDs: [$fightID], dataType: Summons, sourceID: $sourceID, limit: 10000) { data nextPageTimestamp }
@@ -902,7 +954,9 @@ export async function fetchPlayerEvents(params: FetchPlayerEventsParams): Promis
   // ability-filtered query. We merge them into `buffs` so the analyzer sees them.
   const petBuffArgs = `sourceID: ${sourceID}, abilityID: ${petBuffId}`;
 
-  const [casts, playerBuffs, petBuffs, debuffsRaw, meleeHits, resources, summons] = await Promise.all([
+  const crystalArgs = `filterExpression: ${JSON.stringify(crystalFilter)}`;
+
+  const [casts, playerBuffs, petBuffs, debuffsRaw, meleeHits, resources, summons, crystalDebuffs] = await Promise.all([
     collectPaged(repEvents?.casts, 'Casts', srcArgs),
     collectPaged(repEvents?.buffs, 'Buffs', srcArgs),
     collectPaged(repEvents?.petBuffs, 'Buffs', petBuffArgs),
@@ -910,7 +964,14 @@ export async function fetchPlayerEvents(params: FetchPlayerEventsParams): Promis
     collectPaged(repEvents?.damage, 'DamageDone', srcArgs),
     collectPaged(repEvents?.resources, 'Resources', srcArgs),
     collectPaged(repEvents?.summons, 'Summons', srcArgs),
+    params.trackCrystalDebuff
+      ? collectPaged(repEvents?.crystalDebuffs, 'Debuffs', crystalArgs)
+      : Promise.resolve([] as any[]),
   ]);
+
+  const crystalAbility = params.trackCrystalDebuff
+    ? (report?.masterData?.abilities || []).find((a: any) => a?.name === CRYSTAL_DEBUFF_NAME) || null
+    : null;
 
   const buffs = [...playerBuffs, ...petBuffs];
 
@@ -942,6 +1003,9 @@ export async function fetchPlayerEvents(params: FetchPlayerEventsParams): Promis
     bossName: fight.name || 'Unknown Boss',
     ilvl: resolvedIlvl,
     dps,
+    phaseTransitions: fight.phaseTransitions || [],
+    crystalDebuffs,
+    crystalAbility,
     combatant,
     events: {
       casts,

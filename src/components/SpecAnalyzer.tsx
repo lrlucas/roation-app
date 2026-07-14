@@ -1,6 +1,23 @@
 import { useState } from 'react';
 import type { SpecModule } from '../specs';
 
+interface ApmPhase {
+  /** Id de fase WCL (0 = combate completo cuando el jefe no reporta fases). */
+  phase: number;
+  apm: number;
+  casts: number;
+  durationSec: number;
+  name?: string;
+}
+
+/** Jugador del Top 20 seleccionado como referencia de comparación. */
+interface ComparisonPlayer {
+  name: string;
+  metrics?: Record<string, number>;
+  apm_by_phase?: ApmPhase[];
+  dps?: number;
+}
+
 interface PullData {
   report_code: string;
   fight_id: number;
@@ -14,6 +31,7 @@ interface PullData {
   dps: number;
   duration: number;
   metrics: Record<string, number>;
+  apm_by_phase?: ApmPhase[];
 }
 
 interface SpecAnalyzerProps {
@@ -35,12 +53,17 @@ interface SpecAnalyzerProps {
     aggregates: {
       [key: string]: { avg: number; p25: number; p75: number };
     };
+    /** APM del Top 20 agregado por id de fase (clave = String(phaseId)). */
+    apm_by_phase?: Record<string, { avg: number; p25: number; p75: number; sample?: number }>;
     players: any[];
   } | null;
   isFromCache?: boolean;
   userPullData?: PullData | null;
   previousPullData?: PullData | null;
   loadingUserPull?: boolean;
+  /** Si está definido, el objetivo de cada métrica pasa a ser el valor de este
+   *  jugador del Top 20 (la banda p25–p75 sigue mostrando el rango del Top 20). */
+  comparisonPlayer?: ComparisonPlayer | null;
   onRefreshCache?: () => void;
   onRefreshUserPull?: () => void;
 }
@@ -54,6 +77,7 @@ export default function SpecAnalyzer({
   userPullData = null,
   previousPullData = null,
   loadingUserPull = false,
+  comparisonPlayer = null,
   onRefreshCache,
   onRefreshUserPull
 }: SpecAnalyzerProps) {
@@ -80,16 +104,68 @@ export default function SpecAnalyzer({
 
   const { meta, aggregates } = dynamicScores;
 
+  // Comparación individual: si hay un jugador del Top 20 seleccionado, el
+  // objetivo (avg) de cada métrica pasa a ser SU valor; la banda p25–p75
+  // sigue siendo la del Top 20 para no perder el contexto.
+  const effAggregates: typeof aggregates = comparisonPlayer?.metrics
+    ? Object.fromEntries(
+        Object.entries(aggregates).map(([k, agg]) => [
+          k,
+          { ...agg, avg: comparisonPlayer.metrics![k] ?? agg.avg },
+        ])
+      )
+    : aggregates;
+
+  const targetLabel = comparisonPlayer ? comparisonPlayer.name : 'prom. Top 20';
+
+  // APM por fase: valores del pull del usuario + agregados del Top 20.
+  const userApmPhases = userPullData?.apm_by_phase ?? [];
+  const apmPhaseAggregatesRaw: Record<string, { avg: number; p25: number; p75: number; sample?: number }> =
+    dynamicScores.apm_by_phase ?? {};
+  const apmPhaseAggregates = comparisonPlayer?.apm_by_phase
+    ? Object.fromEntries(
+        Object.entries(apmPhaseAggregatesRaw).map(([k, agg]) => {
+          const pv = comparisonPlayer.apm_by_phase!.find(p => String(p.phase) === k)?.apm;
+          return [k, pv != null ? { ...agg, avg: pv } : agg];
+        })
+      )
+    : apmPhaseAggregatesRaw;
+  const formatPhaseDuration = (sec: number) =>
+    `${Math.floor(sec / 60)}:${(sec % 60).toString().padStart(2, '0')}`;
+
+  // Promedio de casts y duración por fase del Top 20, derivado de los datos
+  // por jugador ya guardados en el caché (no requiere re-analizar).
+  const phaseCastAverages: Record<string, { casts: number; durationSec: number; n: number }> = {};
+  {
+    const lists = (dynamicScores.players || [])
+      .map((p: any) => p.apm_by_phase)
+      .filter((l: any): l is ApmPhase[] => Array.isArray(l));
+    const ids = new Set<number>();
+    lists.forEach(l => l.forEach(e => ids.add(e.phase)));
+    ids.forEach(id => {
+      const entries = lists
+        .map(l => l.find(e => e.phase === id))
+        .filter((e): e is ApmPhase => !!e && typeof e.casts === 'number');
+      if (entries.length > 0) {
+        phaseCastAverages[String(id)] = {
+          casts: Math.round(entries.reduce((s, e) => s + e.casts, 0) / entries.length),
+          durationSec: Math.round(entries.reduce((s, e) => s + (e.durationSec || 0), 0) / entries.length),
+          n: entries.length,
+        };
+      }
+    });
+  }
+
   // Per-metric UI definitions + DPS-gain estimates come from the spec module.
-  const metricsInfo = specModule.getMetricsInfo(aggregates);
-  const dpsGains = specModule.computeDpsGains?.(userPullData?.metrics, aggregates) ?? {};
+  const metricsInfo = specModule.getMetricsInfo(effAggregates);
+  const dpsGains = specModule.computeDpsGains?.(userPullData?.metrics, effAggregates) ?? {};
   const totalDpsRecuperables = Object.values(dpsGains).reduce((sum, g) => sum + (g || 0), 0);
   const dpsObjetivo = userPullData ? userPullData.dps + totalDpsRecuperables : 0;
 
   // Build computed metrics list
   const computedMetrics = Object.keys(metricsInfo).map(key => {
     const def = metricsInfo[key];
-    const top20 = aggregates[key] || { avg: 0, p25: 0, p75: 0 };
+    const top20 = effAggregates[key] || { avg: 0, p25: 0, p75: 0 };
     const userVal = userPullData ? (userPullData.metrics[key] ?? 0) : 0;
     const prevVal = previousPullData ? (previousPullData.metrics[key] ?? null) : null;
     
@@ -206,7 +282,7 @@ export default function SpecAnalyzer({
       summaryElement = (
         <>
           <span style={{ color: '#54d196', fontWeight: 700 }}>¡Rotación impecable!</span>{' '}
-          Todas tus métricas analizadas están en ventaja u optimizadas frente al Top 20.
+          Todas tus métricas analizadas están en ventaja u optimizadas frente a {comparisonPlayer ? comparisonPlayer.name : 'el Top 20'}.
         </>
       );
     }
@@ -631,6 +707,97 @@ export default function SpecAnalyzer({
           </div>
         )}
 
+        {/* APM POR FASE DEL JEFE */}
+        {userPullData && userApmPhases.length > 0 && (
+          <div style={{ marginTop: '22px' }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px', marginBottom: '12px' }}>
+              <span style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: '13px', letterSpacing: '0.1em', fontWeight: 700, color: '#8b8f9e' }}>
+                APM POR FASE DEL JEFE
+              </span>
+              <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: '12px', fontWeight: 600, color: '#6c7080' }}>
+                · acciones por minuto vs {comparisonPlayer ? comparisonPlayer.name : `Top ${meta.sample_size}`}
+              </span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '12px' }}>
+              {userApmPhases.map(p => {
+                const agg = apmPhaseAggregates[String(p.phase)];
+                let sevKey: 'critico' | 'atencion' | 'menor' | 'ok' = 'ok';
+                if (agg && agg.avg > 0 && p.apm < agg.avg) {
+                  const r = (agg.avg - p.apm) / agg.avg;
+                  sevKey = r <= 0.08 ? 'menor' : r <= 0.25 ? 'atencion' : 'critico';
+                }
+                const sev = getSeverityMeta(sevKey);
+                const scale = Math.max(p.apm, agg?.p75 ?? 0, 1) * 1.15;
+                const label = p.name || (p.phase > 0 ? `Fase ${p.phase}` : 'Combate completo');
+
+                return (
+                  <div key={p.phase} style={{ backgroundColor: '#15161c', border: '1px solid rgba(255,255,255,0.065)', borderRadius: '13px', padding: '18px 20px', fontFamily: "'Manrope', sans-serif" }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '10px' }}>
+                      <span style={{ color: '#f4f5f8', fontSize: '13.5px', fontWeight: 700, fontFamily: "'Space Grotesk', sans-serif", lineHeight: 1.3 }}>
+                        {label}
+                      </span>
+                      {agg && (
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '3px 9px', borderRadius: '7px', fontSize: '11.5px', fontWeight: 700, color: sev.c, backgroundColor: sev.bg, flexShrink: 0 }}>
+                          <span style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: 'currentColor' }}></span>
+                          {sev.label}
+                        </span>
+                      )}
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: '7px', marginTop: '10px' }}>
+                      <span style={{ fontFamily: "'JetBrains Mono',monospace", fontWeight: 700, fontSize: '28px', letterSpacing: '-0.02em', color: agg ? sev.c : '#f7f8fb' }}>
+                        {p.apm.toFixed(1)}
+                      </span>
+                      <span style={{ fontSize: '12px', fontWeight: 700, color: '#7c8090', letterSpacing: '0.04em' }}>APM</span>
+                      {agg && (
+                        <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: '12px', color: '#7c8090', marginLeft: 'auto' }}>
+                          obj {agg.avg.toFixed(1)}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Banda p25–p75 + objetivo + tu valor */}
+                    <div style={{ position: 'relative', height: '10px', borderRadius: '5px', backgroundColor: 'rgba(255,255,255,0.045)', marginTop: '12px' }}>
+                      {agg && (
+                        <div style={{ position: 'absolute', left: `${(agg.p25 / scale) * 100}%`, width: `${(Math.max(0, agg.p75 - agg.p25) / scale) * 100}%`, top: 0, bottom: 0, backgroundColor: 'rgba(255,255,255,0.10)', borderRadius: '5px' }}></div>
+                      )}
+                      {agg && (
+                        <div style={{ position: 'absolute', left: `${(agg.avg / scale) * 100}%`, top: '-2px', bottom: '-2px', width: '2px', backgroundColor: '#e7e9f0' }}></div>
+                      )}
+                      <div style={{ position: 'absolute', left: `calc(${Math.min(100, (p.apm / scale) * 100)}% - 6px)`, top: '50%', transform: 'translateY(-50%)', width: '12px', height: '12px', borderRadius: '50%', backgroundColor: agg ? sev.c : '#9095a4', border: '2px solid #14151b', boxShadow: `0 0 0 1px ${agg ? sev.c : '#9095a4'}` }}></div>
+                    </div>
+
+                    <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '11px', fontFamily: "'JetBrains Mono', monospace" }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', color: '#8b8f9e' }}>
+                        <span>Tú: <strong style={{ color: '#c2c6d2' }}>{p.casts} casts</strong> · {formatPhaseDuration(p.durationSec)}</span>
+                        <span style={{ color: '#5d6170' }}>
+                          {agg
+                            ? `p25 ${agg.p25.toFixed(1)} · p75 ${agg.p75.toFixed(1)}${agg.sample ? ` · n=${agg.sample}` : ''}`
+                            : 'Top 20: sin datos — recarga el caché'}
+                        </span>
+                      </div>
+                      {(() => {
+                        const refEntry = comparisonPlayer?.apm_by_phase?.find(cp => cp.phase === p.phase);
+                        const target = refEntry
+                          ? { casts: refEntry.casts, durationSec: refEntry.durationSec, label: comparisonPlayer!.name }
+                          : phaseCastAverages[String(p.phase)]
+                            ? { ...phaseCastAverages[String(p.phase)], label: `prom. Top ${phaseCastAverages[String(p.phase)].n}` }
+                            : null;
+                        if (!target) return null;
+                        return (
+                          <div style={{ color: '#5d6170' }}>
+                            {target.label}: <strong style={{ color: '#8b8f9e' }}>{target.casts} casts</strong> · {formatPhaseDuration(target.durationSec)}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* GUIDE MESSAGE WHEN NO PULL */}
         {!userPullData && (
           <div style={{
@@ -657,6 +824,11 @@ export default function SpecAnalyzer({
               <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: '13px', fontWeight: 600, color: '#6c7080' }}>
                 · {shownMetrics.length} de {computedMetrics.length}
               </span>
+              {comparisonPlayer && (
+                <span style={{ padding: '4px 10px', borderRadius: '999px', backgroundColor: 'rgba(167,139,250,0.13)', border: '1px solid rgba(167,139,250,0.3)', fontSize: '12px', fontWeight: 700, color: '#c4b5fd' }}>
+                  comparando vs {comparisonPlayer.name}
+                </span>
+              )}
             </div>
             
             <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
@@ -760,7 +932,7 @@ export default function SpecAnalyzer({
             </span>
             <span style={{ display: 'flex', alignItems: 'center', gap: '7px' }}>
               <span style={{ width: '2px', height: '13px', backgroundColor: '#e7e9f0' }}></span>
-              Objetivo (prom. Top 20)
+              Objetivo ({targetLabel})
             </span>
             <span style={{ display: 'flex', alignItems: 'center', gap: '7px' }}>
               <span style={{ width: '18px', height: '9px', borderRadius: '3px', backgroundColor: 'rgba(255,255,255,0.10)' }}></span>

@@ -13,8 +13,8 @@ import BurstPartyPanel from './components/BurstPartyPanel';
 import SpecAnalyzer from './components/SpecAnalyzer';
 import AvoidableDamagePanel from './components/AvoidableDamagePanel';
 import RecapPanel from './components/RecapPanel';
-import { getRankings, getReportEvents, getReportFights, fetchPlayerEvents } from './api/warcraftlogs';
-import type { FilterState, RankingsData, RankingEntry, ReportFight } from './types/warcraftlogs';
+import { getRankings, getReportEvents, getReportFightsWithPhases, fetchPlayerEvents } from './api/warcraftlogs';
+import type { FilterState, RankingsData, RankingEntry, ReportFight, ReportEncounterPhases } from './types/warcraftlogs';
 import { analyzePlayerCasts } from './utils/unholyDkAnalyzerUtils';
 import { getSpecModule, isSupportedSpec } from './specs';
 import type { UnholyDkMetrics } from './utils/unholyDkAnalyzerUtils';
@@ -34,6 +34,60 @@ function formatAmount(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}K`;
   return n.toFixed(0);
+}
+
+export interface ApmPhaseEntry {
+  /** Id de fase WCL (0 = combate completo cuando el jefe no reporta fases). */
+  phase: number;
+  apm: number;
+  casts: number;
+  durationSec: number;
+  name?: string;
+}
+
+/**
+ * APM por fase: divide el combate en ventanas según las transiciones de fase
+ * y cuenta los casts del jugador en cada una. Si una fase se repite (p.ej.
+ * vuelve tras una intermission), sus ventanas se acumulan en una sola entrada.
+ */
+function computeApmByPhase(
+  casts: any[],
+  fightStart: number,
+  fightEnd: number,
+  phaseTransitions: { id: number; startTime: number }[] | null | undefined,
+): ApmPhaseEntry[] {
+  if (fightEnd <= fightStart) return [];
+
+  const transitions = (phaseTransitions || [])
+    .slice()
+    .sort((a, b) => a.startTime - b.startTime);
+
+  const windows = transitions.length > 0
+    ? transitions.map((t, i) => ({
+        phase: t.id,
+        start: Math.max(t.startTime, fightStart),
+        end: i + 1 < transitions.length ? transitions[i + 1].startTime : fightEnd,
+      }))
+    : [{ phase: 0, start: fightStart, end: fightEnd }];
+
+  const byPhase = new Map<number, { casts: number; durationMs: number }>();
+  for (const w of windows) {
+    if (w.end <= w.start) continue;
+    const count = casts.filter(c => c.type === 'cast' && c.timestamp >= w.start && c.timestamp < w.end).length;
+    const acc = byPhase.get(w.phase) || { casts: 0, durationMs: 0 };
+    acc.casts += count;
+    acc.durationMs += w.end - w.start;
+    byPhase.set(w.phase, acc);
+  }
+
+  return [...byPhase.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([phase, { casts: count, durationMs }]) => ({
+      phase,
+      casts: count,
+      durationSec: Math.round(durationMs / 1000),
+      apm: durationMs > 0 ? Number((count / (durationMs / 60000)).toFixed(1)) : 0,
+    }));
 }
 
 export default function App() {
@@ -61,11 +115,16 @@ export default function App() {
   const [loadingUserPull, setLoadingUserPull] = useState(false);
   const [selectedPlayer, setSelectedPlayer] = useState<any | null>(null);
   const [isFromCache, setIsFromCache] = useState(false);
+  const [showCrystal, setShowCrystal] = useState(false);
+  // Jugador del Top 20 seleccionado como referencia de comparación en el analizador.
+  const [comparisonPlayer, setComparisonPlayer] = useState<any | null>(null);
   const [firebaseError, setFirebaseError] = useState<string | null>(null);
   const [reportInput, setReportInput] = useState('');
   const [loadingFights, setLoadingFights] = useState(false);
   const [reportError, setReportError] = useState<string | null>(null);
   const [fights, setFights] = useState<ReportFight[]>([]);
+  const [reportPhases, setReportPhases] = useState<ReportEncounterPhases[]>([]);
+  const [separateWipesByPhase, setSeparateWipesByPhase] = useState(true);
   const [selectedFight, setSelectedFight] = useState<ReportFight | null>(null);
   const [reportCode, setReportCode] = useState<string | null>(null);
   const [preselectedEncounterId, setPreselectedEncounterId] = useState<number | null>(null);
@@ -297,12 +356,14 @@ export default function App() {
     setLoadingFights(true);
     setReportError(null);
     setFights([]);
+    setReportPhases([]);
     setSelectedFight(null);
     setReportCode(code);
-    
+
     try {
-      const data = await getReportFights(code);
-      setFights(data);
+      const data = await getReportFightsWithPhases(code);
+      setFights(data.fights);
+      setReportPhases(data.phases);
     } catch (err) {
       setReportError(err instanceof Error ? err.message : 'Error desconocido al cargar reporte');
     } finally {
@@ -506,6 +567,21 @@ export default function App() {
           response.fightEndTime
         );
 
+        // APM por fase del pull del usuario, con el nombre real de cada fase
+        // según los metadatos del reporte cargado.
+        const phaseMeta = reportPhases.find(rp => rp.encounterID === (selectedFight.encounterID ?? response.bossId));
+        const apmByPhase = computeApmByPhase(
+          response.events.casts,
+          response.fightStartTime,
+          response.fightEndTime,
+          response.phaseTransitions,
+        ).map(p => ({
+          ...p,
+          name: p.phase > 0
+            ? (phaseMeta?.phases?.find(ph => ph.id === p.phase)?.name || `Fase ${p.phase}`)
+            : 'Combate completo',
+        }));
+
         const newPullRecord = {
           report_code: reportCode,
           fight_id: selectedFight.id,
@@ -519,6 +595,7 @@ export default function App() {
           dps: response.dps,
           duration: Math.round((response.fightEndTime - response.fightStartTime) / 1000),
           metrics: metrics,
+          apm_by_phase: apmByPhase,
           vs_top20: currentAggregates,
         };
 
@@ -572,6 +649,7 @@ export default function App() {
     setFirebaseError(null);
     setUserPullData(null);
     setPreviousPullData(null);
+    setComparisonPlayer(null);
 
     // 1. Check cache first using query (if not bypassed)
     if (!bypassCache) {
@@ -643,9 +721,13 @@ export default function App() {
     const results: any[] = [];
     const successfulEntries: RankingEntry[] = [];
 
+    // Mecánica del Dawn Crystal (debuff Glimmering): solo en Midnight Falls Mítico.
+    const trackCrystal = filters.encounterId === 3183 && filters.difficulty === 5;
+    let crystalIcon: string | null = null;
+
     for (let i = 0; i < total; i += batchSize) {
       const batch = entries.slice(i, i + batchSize);
-      
+
       await Promise.all(
         batch.map(async (entry) => {
           try {
@@ -655,6 +737,7 @@ export default function App() {
               playerName: entry.name,
               debuffIds: specModule.debuffIds,
               petBuffIds: specModule.petBuffIds,
+              trackCrystalDebuff: trackCrystal,
             });
 
             const metrics = specModule.analyze(
@@ -662,6 +745,13 @@ export default function App() {
               response.fightStartTime,
               response.fightEndTime
             );
+
+            const carriedCrystal = trackCrystal && response.crystalDebuffs.some((e: any) =>
+              e.targetID === response.actorId &&
+              (e.type === 'applydebuff' || e.type === 'applydebuffstack' || e.type === 'refreshdebuff'));
+            if (!crystalIcon && response.crystalAbility?.icon) {
+              crystalIcon = response.crystalAbility.icon;
+            }
 
             const playerRecord = {
               name: entry.name,
@@ -671,7 +761,14 @@ export default function App() {
               duration: Math.round((response.fightEndTime - response.fightStartTime) / 1000), // seconds
               report_code: entry.report.code,
               fight_id: entry.report.fightID,
-              metrics: metrics
+              metrics: metrics,
+              carried_crystal: carriedCrystal,
+              apm_by_phase: computeApmByPhase(
+                response.events.casts,
+                response.fightStartTime,
+                response.fightEndTime,
+                response.phaseTransitions,
+              ),
             };
 
             results.push(playerRecord);
@@ -697,6 +794,20 @@ export default function App() {
         aggregates[key] = calculateAggregates(values);
       });
 
+      // APM por fase del Top 20: agregado por id de fase, solo sobre los
+      // jugadores cuyo pull llegó a esa fase.
+      const apmPhaseIds = new Set<number>();
+      results.forEach(r => (r.apm_by_phase || []).forEach((p: any) => apmPhaseIds.add(p.phase)));
+      const apmByPhaseAgg: Record<string, { avg: number; p25: number; p75: number; sample: number }> = {};
+      apmPhaseIds.forEach(id => {
+        const values = results
+          .map(r => (r.apm_by_phase || []).find((p: any) => p.phase === id)?.apm)
+          .filter((v: any): v is number => typeof v === 'number');
+        if (values.length > 0) {
+          apmByPhaseAgg[String(id)] = { ...calculateAggregates(values), sample: values.length };
+        }
+      });
+
       // Calculate ilvl range
       const ilvls = results.map(r => r.ilvl);
       const ilvlMin = Math.min(...ilvls);
@@ -717,9 +828,11 @@ export default function App() {
           ilvl_min: ilvlMin,
           ilvl_max: ilvlMax,
           patch: filters.patch,
-          sample_size: results.length
+          sample_size: results.length,
+          crystal_icon: crystalIcon
         },
         aggregates,
+        apm_by_phase: apmByPhaseAgg,
         players: results
       };
 
@@ -770,6 +883,7 @@ export default function App() {
     setFirebaseError(null);
     setUserPullData(null);
     setPreviousPullData(null);
+    setComparisonPlayer(null);
     setCurrentDifficulty(filters.difficulty);
     setSelectedEncounterName(encounterName);
     setSelectedDifficultyName(difficultyName);
@@ -871,6 +985,75 @@ export default function App() {
       // normalize spec capitalization to match registry (e.g. "unholy" → "Unholy")
       selectedParse.spec.charAt(0).toUpperCase() + selectedParse.spec.slice(1).toLowerCase(),
     );
+
+  // Switch "Cristal": solo tiene sentido en Midnight Falls (3183) Mítico (5).
+  const crystalEligible = searchedFilters?.encounterId === 3183 && searchedFilters?.difficulty === 5;
+  // masterData de WCL ya incluye la extensión en el icono (p.ej. "xxx.jpg")
+  const crystalIconUrl = analysisRulesData?.meta?.crystal_icon
+    ? `https://wow.zamimg.com/images/wow/icons/large/${String(analysisRulesData.meta.crystal_icon).replace(/\.jpg$/i, '')}.jpg`
+    : null;
+  const hasCrystalData = !!analysisRulesData?.players?.some((p: any) => typeof p.carried_crystal === 'boolean');
+
+  const getPhaseName = (encounterID: number | undefined, phaseId: number): string => {
+    const meta = reportPhases.find(p => p.encounterID === encounterID);
+    const phase = meta?.phases?.find(ph => ph.id === phaseId);
+    return phase?.name || `Fase ${phaseId}`;
+  };
+
+  // Color del % de vida del jefe al estilo WCL: menos vida restante = color más "raro"
+  const bossPctColor = (pct: number): string =>
+    pct <= 10 ? '#c084fc' : pct <= 25 ? '#60a5fa' : pct <= 50 ? '#4ade80' : '#e2e8f0';
+
+  const renderPullButton = (fight: ReportFight, pullNumber: number) => {
+    const durationMs = fight.endTime - fight.startTime;
+    const pct = fight.kill ? null : fight.bossPercentage ?? null;
+    return (
+      <button
+        key={fight.id}
+        onClick={() => handleSelectFight(fight)}
+        style={{
+          backgroundColor: selectedFight?.id === fight.id ? '#1e3a8a' : '#1f2937',
+          border: `1px solid ${selectedFight?.id === fight.id ? '#3b82f6' : '#374151'}`,
+          padding: '8px 16px',
+          borderRadius: '6px',
+          cursor: 'pointer',
+          fontSize: '13px',
+          fontWeight: 500,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'flex-start',
+          gap: '4px',
+          transition: 'all 0.2s',
+          minWidth: '120px'
+        }}
+      >
+        <span style={{ color: '#f8fafc', display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, width: '100%' }}>
+          Pull {pullNumber}
+          {fight.kill && (
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34d399" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="20 6 9 17 4 12"></polyline>
+            </svg>
+          )}
+          {pct != null && (
+            <span style={{ marginLeft: 'auto', color: bossPctColor(pct), fontWeight: 700, fontSize: '12px' }}>
+              {pct < 10 ? pct.toFixed(1) : Math.round(pct)}%
+            </span>
+          )}
+        </span>
+        <span style={{ fontSize: '11px', color: fight.kill ? '#34d399' : '#f87171' }}>
+          {fight.kill ? 'Kill' : 'Wipe'} • {formatDuration(durationMs)}
+          {!!fight.lastPhase && fight.lastPhase > 0 && (
+            <span style={{ color: '#64748b' }}> • P{fight.lastPhase}</span>
+          )}
+        </span>
+        {pct != null && (
+          <div style={{ width: '100%', height: '3px', backgroundColor: '#0d1117', borderRadius: '2px', overflow: 'hidden' }}>
+            <div style={{ width: `${Math.max(0, Math.min(100, 100 - pct))}%`, height: '100%', backgroundColor: bossPctColor(pct) }} />
+          </div>
+        )}
+      </button>
+    );
+  };
 
   return (
     <div style={{
@@ -1112,7 +1295,18 @@ export default function App() {
           {/* Fights List */}
           {fights.length > 0 && (
             <div style={{ backgroundColor: '#131720', border: '1px solid #2a2f3e', borderRadius: '12px', padding: '24px', boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.3)' }}>
-              <h2 style={{ color: '#e2e8f0', margin: '0 0 16px 0', fontSize: '16px', fontWeight: 700 }}>Selecciona un Pull</h2>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '0 0 16px 0' }}>
+                <h2 style={{ color: '#e2e8f0', margin: 0, fontSize: '16px', fontWeight: 700 }}>Selecciona un Pull</h2>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontSize: '13px', cursor: 'pointer', userSelect: 'none' }}>
+                  <input
+                    type="checkbox"
+                    checked={separateWipesByPhase}
+                    onChange={e => setSeparateWipesByPhase(e.target.checked)}
+                    style={{ accentColor: '#3b82f6', width: '14px', height: '14px', cursor: 'pointer' }}
+                  />
+                  Separar wipes por fase
+                </label>
+              </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', maxHeight: '350px', overflowY: 'auto', paddingRight: '8px' }}>
                 {Object.entries(
                   fights.reduce((acc, fight) => {
@@ -1121,48 +1315,67 @@ export default function App() {
                     acc[name].push(fight);
                     return acc;
                   }, {} as Record<string, ReportFight[]>)
-                ).map(([bossName, bossFights]) => (
-                  <div key={bossName}>
-                    <h3 style={{ color: '#94a3b8', margin: '0 0 12px 0', fontSize: '13px', borderBottom: '1px solid #2a2f3e', paddingBottom: '8px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                      {bossName}
-                    </h3>
-                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                      {bossFights.map((fight, index) => (
-                        <button
-                          key={fight.id}
-                          onClick={() => handleSelectFight(fight)}
-                          style={{
-                            backgroundColor: selectedFight?.id === fight.id ? '#1e3a8a' : '#1f2937',
-                            border: `1px solid ${selectedFight?.id === fight.id ? '#3b82f6' : '#374151'}`,
-                            padding: '8px 16px',
-                            borderRadius: '6px',
-                            cursor: 'pointer',
-                            fontSize: '13px',
-                            fontWeight: 500,
-                            display: 'flex',
-                            flexDirection: 'column',
-                            alignItems: 'flex-start',
-                            gap: '4px',
-                            transition: 'all 0.2s',
-                            minWidth: '120px'
-                          }}
-                        >
-                          <span style={{ color: '#f8fafc', display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600 }}>
-                            Pull {index + 1}
-                            {fight.kill && (
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34d399" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-                                <polyline points="20 6 9 17 4 12"></polyline>
-                              </svg>
-                            )}
-                          </span>
-                          <span style={{ fontSize: '11px', color: fight.kill ? '#34d399' : '#f87171' }}>
-                            {fight.kill ? 'Kill' : 'Wipe'} • {Math.round((fight.endTime - fight.startTime) / 1000)}s
-                          </span>
-                        </button>
-                      ))}
+                ).map(([bossName, bossFights]) => {
+                  // El número de pull es global por jefe (cronológico), aunque se agrupe por fase
+                  const numbered = bossFights.map((fight, index) => ({ fight, pullNumber: index + 1 }));
+                  const hasPhaseData = numbered.some(({ fight }) => fight.lastPhase != null && fight.lastPhase > 0);
+                  const splitByPhase = separateWipesByPhase && hasPhaseData;
+
+                  let phaseGroups: { phaseId: number; entries: typeof numbered }[] = [];
+                  if (splitByPhase) {
+                    const grouped = new Map<number, typeof numbered>();
+                    numbered.forEach(entry => {
+                      const key = entry.fight.lastPhase && entry.fight.lastPhase > 0 ? entry.fight.lastPhase : 0;
+                      if (!grouped.has(key)) grouped.set(key, []);
+                      grouped.get(key)!.push(entry);
+                    });
+                    phaseGroups = [...grouped.entries()]
+                      .map(([phaseId, entries]) => ({ phaseId, entries }))
+                      .sort((a, b) => (a.phaseId === 0 ? Infinity : a.phaseId) - (b.phaseId === 0 ? Infinity : b.phaseId));
+                  }
+
+                  return (
+                    <div key={bossName}>
+                      <h3 style={{ color: '#94a3b8', margin: '0 0 12px 0', fontSize: '13px', borderBottom: '1px solid #2a2f3e', paddingBottom: '8px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                        {bossName}
+                      </h3>
+                      {splitByPhase ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                          {phaseGroups.map(group => {
+                            const wipes = group.entries.filter(e => !e.fight.kill).length;
+                            const kills = group.entries.length - wipes;
+                            const totalMs = group.entries.reduce((acc, e) => acc + (e.fight.endTime - e.fight.startTime), 0);
+                            const counts = [
+                              wipes > 0 ? `${wipes} wipe${wipes !== 1 ? 's' : ''}` : '',
+                              kills > 0 ? `${kills} kill${kills !== 1 ? 's' : ''}` : '',
+                            ].filter(Boolean).join(', ');
+                            return (
+                              <div key={group.phaseId}>
+                                <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', margin: '0 0 8px 0' }}>
+                                  <span style={{ color: '#f8fafc', fontSize: '13px', fontWeight: 700 }}>
+                                    {group.phaseId === 0
+                                      ? 'Sin fase'
+                                      : getPhaseName(group.entries[0].fight.encounterID, group.phaseId)}
+                                  </span>
+                                  <span style={{ color: '#f87171', fontSize: '12px' }}>
+                                    ({counts}, {formatDuration(totalMs)})
+                                  </span>
+                                </div>
+                                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                                  {group.entries.map(({ fight, pullNumber }) => renderPullButton(fight, pullNumber))}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                          {numbered.map(({ fight, pullNumber }) => renderPullButton(fight, pullNumber))}
+                        </div>
+                      )}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
@@ -1355,6 +1568,66 @@ export default function App() {
                   <span style={{ fontSize: '12px', color: '#64748b' }}>
                     {analyzedEntries.length} de {rankings?.rankings.slice(0, 20).length || 20} cargados con éxito
                   </span>
+                  <div style={{ fontSize: '11px', color: '#64748b', marginTop: '6px', lineHeight: 1.4 }}>
+                    Haz clic en un registro para comparar tus métricas contra ese jugador en vez del promedio del Top 20.
+                  </div>
+
+                  {/* Switch Cristal (Glimmering) — solo Midnight Falls Mítico */}
+                  <div
+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '12px' }}
+                    title={crystalEligible
+                      ? 'Marcar quién llevó el Cristal (debuff Glimmering)'
+                      : 'Disponible solo para Midnight Falls en Mítico'}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', opacity: crystalEligible ? 1 : 0.4 }}>
+                      {crystalIconUrl ? (
+                        <img
+                          src={crystalIconUrl}
+                          alt="Glimmering"
+                          style={{ width: 20, height: 20, borderRadius: 4, border: '1px solid rgba(251,191,36,0.4)' }}
+                          onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                        />
+                      ) : (
+                        <span style={{ width: 12, height: 12, borderRadius: '50%', backgroundColor: '#fbbf24', display: 'inline-block', boxShadow: '0 0 6px rgba(251,191,36,0.7)' }} />
+                      )}
+                      <span style={{ fontSize: '13px', fontWeight: 600, color: '#e2e8f0' }}>Cristal</span>
+                    </div>
+                    <button
+                      onClick={() => crystalEligible && setShowCrystal(v => !v)}
+                      disabled={!crystalEligible}
+                      style={{
+                        width: 38,
+                        height: 20,
+                        borderRadius: 999,
+                        border: `1px solid ${showCrystal && crystalEligible ? '#fbbf24' : '#374151'}`,
+                        backgroundColor: showCrystal && crystalEligible ? 'rgba(251,191,36,0.25)' : '#1f2937',
+                        position: 'relative',
+                        cursor: crystalEligible ? 'pointer' : 'not-allowed',
+                        padding: 0,
+                        opacity: crystalEligible ? 1 : 0.45,
+                        transition: 'all 0.15s'
+                      }}
+                    >
+                      <span style={{
+                        position: 'absolute',
+                        top: 2,
+                        left: showCrystal && crystalEligible ? 20 : 2,
+                        width: 14,
+                        height: 14,
+                        borderRadius: '50%',
+                        backgroundColor: showCrystal && crystalEligible ? '#fbbf24' : '#64748b',
+                        transition: 'left 0.15s'
+                      }} />
+                    </button>
+                  </div>
+                  {showCrystal && crystalEligible && (
+                    <div style={{ marginTop: '8px', fontSize: '11px', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '6px', lineHeight: 1.4 }}>
+                      <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#fbbf24', flexShrink: 0, boxShadow: '0 0 5px rgba(251,191,36,0.8)' }} />
+                      {hasCrystalData
+                        ? 'Llevó el Cristal (debuff Glimmering)'
+                        : 'El caché actual no tiene datos del Cristal — usa "Recargar Combate" para re-analizar.'}
+                    </div>
+                  )}
                 </div>
                 
                 {analyzedEntries.length === 0 ? (
@@ -1363,27 +1636,64 @@ export default function App() {
                   </div>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                    {analyzedEntries.map((entry, idx) => (
-                      <div 
-                        key={`${entry.name}-${idx}`} 
+                    {analyzedEntries.map((entry, idx) => {
+                      const playerRec = analysisRulesData?.players?.find((p: any) =>
+                        p.name === entry.name &&
+                        p.fight_id === entry.report.fightID &&
+                        p.report_code === entry.report.code
+                      );
+                      const carriedCrystal = showCrystal && crystalEligible && !!playerRec?.carried_crystal;
+                      const isComparing = !!comparisonPlayer &&
+                        comparisonPlayer.name === entry.name &&
+                        comparisonPlayer.fight_id === entry.report.fightID &&
+                        comparisonPlayer.report_code === entry.report.code;
+
+                      return (
+                      <div
+                        key={`${entry.name}-${idx}`}
+                        onClick={() => {
+                          if (!playerRec) return;
+                          setComparisonPlayer(isComparing ? null : playerRec);
+                        }}
                         style={{
-                          backgroundColor: '#1e293b',
-                          border: '1px solid #334155',
+                          backgroundColor: isComparing ? 'rgba(167,139,250,0.10)' : '#1e293b',
+                          border: `1px solid ${isComparing ? '#a78bfa' : carriedCrystal ? 'rgba(251,191,36,0.45)' : '#334155'}`,
                           borderRadius: '8px',
                           padding: '12px',
                           display: 'flex',
                           flexDirection: 'column',
                           gap: '6px',
                           fontSize: '13px',
-                          transition: 'border-color 0.2s'
+                          transition: 'border-color 0.2s, background-color 0.2s',
+                          cursor: playerRec ? 'pointer' : 'default'
+                        }}
+                        onMouseEnter={(e) => {
+                          if (playerRec && !isComparing) e.currentTarget.style.borderColor = '#a78bfa';
+                        }}
+                        onMouseLeave={(e) => {
+                          if (!isComparing) e.currentTarget.style.borderColor = carriedCrystal ? 'rgba(251,191,36,0.45)' : '#334155';
                         }}
                       >
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                          <span style={{ color: '#c084fc', fontWeight: 600 }}>{entry.name}</span>
-                          <a 
+                          <span style={{ color: '#c084fc', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '7px' }}>
+                            {entry.name}
+                            {carriedCrystal && (
+                              <span
+                                title="Llevó el Cristal (debuff Glimmering)"
+                                style={{ width: 9, height: 9, borderRadius: '50%', backgroundColor: '#fbbf24', display: 'inline-block', flexShrink: 0, boxShadow: '0 0 6px rgba(251,191,36,0.85)' }}
+                              />
+                            )}
+                            {isComparing && (
+                              <span style={{ padding: '1px 7px', borderRadius: '999px', backgroundColor: 'rgba(167,139,250,0.16)', border: '1px solid rgba(167,139,250,0.35)', fontSize: '10px', fontWeight: 700, color: '#c4b5fd', flexShrink: 0 }}>
+                                Comparando
+                              </span>
+                            )}
+                          </span>
+                          <a
                             href={`https://www.warcraftlogs.com/reports/${entry.report.code}#fight=${entry.report.fightID}`}
                             target="_blank"
                             rel="noopener noreferrer"
+                            onClick={(e) => e.stopPropagation()}
                             style={{
                               color: '#38bdf8',
                               fontSize: '11px',
@@ -1404,7 +1714,8 @@ export default function App() {
                           <span style={{ fontFamily: 'monospace' }}>{formatAmount(entry.amount)} DPS</span>
                         </div>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1484,6 +1795,7 @@ export default function App() {
                     userPullData={userPullData}
                     previousPullData={previousPullData}
                     loadingUserPull={loadingUserPull}
+                    comparisonPlayer={comparisonPlayer}
                     onRefreshCache={() => {
                       if (rankings && searchedFilters) {
                         runTop50Analysis(rankings, searchedFilters, true);
