@@ -1,0 +1,40 @@
+{
+  "US": [
+    "Area 52",
+    "Bleeding Hollow",
+    "Illidan",
+    "Mal'Ganis",
+    "Proudmoore",
+    "Ragnaros",
+    "Stormrage",
+    "Tichondrius",
+    "Zul'jin",
+    "Thrall",
+    "Sargeras",
+    "Dalaran"
+  ],
+  "EU": [
+    "Draenor",
+    "Kazzak",
+    "Ravencrest",
+    "Silvermoon",
+    "Tarren Mill",
+    "Twisting Nether",
+    "Hyjal",
+    "Blackrock",
+    "Dentarg"
+  ],
+  "KR": [
+    "Azshara",
+    "Burning Legion",
+    "Hellscream"
+  ],
+  "TW": [
+    "Shadowmoon",
+    "World Tree",
+    "Wrathbringer"
+  ],
+  "CN": [
+    "魔獸"
+  ]
+}

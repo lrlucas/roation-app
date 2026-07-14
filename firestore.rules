@@ -1,0 +1,33 @@
+rules_version = '2';
+
+// Reglas con alcance limitado (la app NO usa Firebase Auth todavía).
+// Solo se exponen las dos colecciones que usa la app, con las operaciones
+// exactas que realiza (nunca borra → delete denegado). Todo lo demás, cerrado.
+//
+// ⚠️ Estas colecciones siguen siendo escribibles por cualquiera que conozca el
+// projectId (el apiKey es público en el bundle). Es aceptable para una app de
+// desarrollo sin datos sensibles; el paso siguiente sería Anonymous Auth +
+// `request.auth != null`.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Caché de análisis APL: la app lee por query y escribe con setDoc.
+    match /apl_analysis_cache/{docId} {
+      allow read: if true;
+      allow create, update: if true;
+      allow delete: if false;
+    }
+
+    // Historial de pulls (usuario hardcodeado test_user por ahora).
+    match /users/{userId}/pulls/{pullId} {
+      allow read: if true;
+      allow create: if true;
+      allow update, delete: if false;
+    }
+
+    // Todo lo demás: denegado.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
