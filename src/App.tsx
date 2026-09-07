@@ -13,12 +13,18 @@ import BurstPartyPanel from './components/BurstPartyPanel';
 import SpecAnalyzer from './components/SpecAnalyzer';
 import AvoidableDamagePanel from './components/AvoidableDamagePanel';
 import RecapPanel from './components/RecapPanel';
+import ArgusCounterPanel from './components/ArgusCounterPanel';
+import ArgusCounterView from './components/ArgusCounterView';
+import { ReportInputCard, FightsList, FightPlayersList } from './components/ReportPicker';
+import { fetchFightPlayers } from './utils/reportPlayers';
+import type { FightPlayer } from './utils/reportPlayers';
 import { getRankings, getReportEvents, getReportFightsWithPhases, fetchPlayerEvents } from './api/warcraftlogs';
 import type { FilterState, RankingsData, RankingEntry, ReportFight, ReportEncounterPhases } from './types/warcraftlogs';
 import { analyzePlayerCasts } from './utils/unholyDkAnalyzerUtils';
+import { analyzeArgusWindows } from './utils/demoWarlockAnalyzerUtils';
 import { getSpecModule, isSupportedSpec } from './specs';
 import type { UnholyDkMetrics } from './utils/unholyDkAnalyzerUtils';
-import { WOW_CLASSES } from './data/wowData';
+import { WOW_CLASSES, CURRENT_SEASON } from './data/wowData';
 import { doc, getDoc, setDoc, collection, query, where, getDocs, addDoc } from 'firebase/firestore';
 import { db } from './api/firebase';
 import './index.css';
@@ -102,7 +108,7 @@ export default function App() {
   const isBurstEnabled = import.meta.env.VITE_FEATURE_BURST === 'true';
   const isAvoidableEnabled = import.meta.env.VITE_FEATURE_AVOIDABLE === 'true';
   const isRecapEnabled = import.meta.env.VITE_FEATURE_RECAP === 'true';
-  const [activeFeature, setActiveFeature] = useState<'rotation' | 'burst' | 'analyzer' | 'avoidable' | 'recap'>(isRotationEnabled ? 'rotation' : 'burst');
+  const [activeFeature, setActiveFeature] = useState<'rotation' | 'burst' | 'analyzer' | 'avoidable' | 'recap' | 'argus'>(isRotationEnabled ? 'rotation' : 'burst');
   const [selectedEncounterName, setSelectedEncounterName] = useState('');
   const [selectedDifficultyName, setSelectedDifficultyName] = useState('');
   const [searchedFilters, setSearchedFilters] = useState<FilterState | null>(null);
@@ -131,7 +137,7 @@ export default function App() {
   const [preselectedDifficultyId, setPreselectedDifficultyId] = useState<number | null>(null);
   const [preselectedClassName, setPreselectedClassName] = useState<string | null>(null);
   const [preselectedSpecName, setPreselectedSpecName] = useState<string | null>(null);
-  const [fightPlayers, setFightPlayers] = useState<{ id: number; name: string; className: string; specName: string; classColor: string }[]>([]);
+  const [fightPlayers, setFightPlayers] = useState<FightPlayer[]>([]);
   const [loadingPlayers, setLoadingPlayers] = useState(false);
   const [availableEncounters, setAvailableEncounters] = useState<{ id: number; name: string }[]>([]);
   
@@ -392,44 +398,7 @@ export default function App() {
 
     setLoadingPlayers(true);
     try {
-      const response = await getReportEvents({
-        code: reportCode,
-        fightID: fight.id,
-        startTime: fight.startTime,
-        endTime: fight.endTime
-      });
-
-      const participantIds = new Set<number>();
-      response.events.forEach((e: any) => {
-        if (e.sourceID !== undefined) participantIds.add(e.sourceID);
-      });
-
-      const classColors: Record<string, string> = {
-        Warrior: '#C69B6D', Paladin: '#F48CBA', Hunter: '#ABD473', Rogue: '#FFF468',
-        Priest: '#FFFFFF', DeathKnight: '#C41E3A', Shaman: '#0070DE', Mage: '#3FC7EB',
-        Warlock: '#8788EE', Monk: '#00FF98', Druid: '#FF7D0A', DemonHunter: '#A330C9',
-        Evoker: '#33937F'
-      };
-
-      const composition = response.composition || [];
-
-      const players = response.actors
-        .filter((a: any) => a.type === 'Player' && participantIds.has(a.id))
-        .map((a: any) => {
-          const comp = composition.find((c: any) => c.id === a.id);
-          const className = comp?.type || a.subType || '';
-          const specName = comp?.specs?.[0]?.spec || comp?.specs?.[0]?.name || '';
-          return {
-            id: a.id,
-            name: a.name,
-            className,
-            specName,
-            classColor: classColors[className] || '#cbd5e1'
-          };
-        });
-
-      players.sort((a: any, b: any) => a.name.localeCompare(b.name));
-      setFightPlayers(players);
+      setFightPlayers(await fetchFightPlayers(reportCode, fight));
     } catch (err) {
       console.error('Error loading players for fight:', err);
     } finally {
@@ -503,9 +472,9 @@ export default function App() {
 
         // If aggregates not in state, look up from Firestore cache
         if (!currentAggregates) {
-          const encounterId = preselectedEncounterId || selectedFight.encounterID || 3183;
+          const encounterId = preselectedEncounterId || selectedFight.encounterID || CURRENT_SEASON.finalBossEncounterId;
           const difficulty = preselectedDifficultyId || selectedFight.difficulty || 5;
-          const patch = searchedFilters?.patch || '12.5';
+          const patch = searchedFilters?.patch || CURRENT_SEASON.patch;
 
           const q = query(
             collection(db, "apl_analysis_cache"),
@@ -582,6 +551,13 @@ export default function App() {
             : 'Combate completo',
         }));
 
+        // Ventana a ventana de Dominion of Argus (solo Demonology; el resto de specs
+        // no tienen el buff, así que devuelve []). Se guarda en el pull para que el
+        // panel no tenga que re-descargar los eventos.
+        const argusWindows = specModule.cacheSpec === 'Demonology'
+          ? analyzeArgusWindows(response.events, response.fightStartTime, response.fightEndTime)
+          : [];
+
         const newPullRecord = {
           report_code: reportCode,
           fight_id: selectedFight.id,
@@ -590,12 +566,13 @@ export default function App() {
           player_name: player.name,
           spec: specModule.cacheSpec,
           ilvl: response.ilvl,
-          patch: searchedFilters?.patch || '12.5',
+          patch: searchedFilters?.patch || CURRENT_SEASON.patch,
           timestamp: new Date().toISOString(),
           dps: response.dps,
           duration: Math.round((response.fightEndTime - response.fightStartTime) / 1000),
           metrics: metrics,
           apm_by_phase: apmByPhase,
+          argus_windows_detail: argusWindows,
           vs_top20: currentAggregates,
         };
 
@@ -1000,61 +977,6 @@ export default function App() {
     return phase?.name || `Fase ${phaseId}`;
   };
 
-  // Color del % de vida del jefe al estilo WCL: menos vida restante = color más "raro"
-  const bossPctColor = (pct: number): string =>
-    pct <= 10 ? '#c084fc' : pct <= 25 ? '#60a5fa' : pct <= 50 ? '#4ade80' : '#e2e8f0';
-
-  const renderPullButton = (fight: ReportFight, pullNumber: number) => {
-    const durationMs = fight.endTime - fight.startTime;
-    const pct = fight.kill ? null : fight.bossPercentage ?? null;
-    return (
-      <button
-        key={fight.id}
-        onClick={() => handleSelectFight(fight)}
-        style={{
-          backgroundColor: selectedFight?.id === fight.id ? '#1e3a8a' : '#1f2937',
-          border: `1px solid ${selectedFight?.id === fight.id ? '#3b82f6' : '#374151'}`,
-          padding: '8px 16px',
-          borderRadius: '6px',
-          cursor: 'pointer',
-          fontSize: '13px',
-          fontWeight: 500,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'flex-start',
-          gap: '4px',
-          transition: 'all 0.2s',
-          minWidth: '120px'
-        }}
-      >
-        <span style={{ color: '#f8fafc', display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600, width: '100%' }}>
-          Pull {pullNumber}
-          {fight.kill && (
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34d399" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="20 6 9 17 4 12"></polyline>
-            </svg>
-          )}
-          {pct != null && (
-            <span style={{ marginLeft: 'auto', color: bossPctColor(pct), fontWeight: 700, fontSize: '12px' }}>
-              {pct < 10 ? pct.toFixed(1) : Math.round(pct)}%
-            </span>
-          )}
-        </span>
-        <span style={{ fontSize: '11px', color: fight.kill ? '#34d399' : '#f87171' }}>
-          {fight.kill ? 'Kill' : 'Wipe'} • {formatDuration(durationMs)}
-          {!!fight.lastPhase && fight.lastPhase > 0 && (
-            <span style={{ color: '#64748b' }}> • P{fight.lastPhase}</span>
-          )}
-        </span>
-        {pct != null && (
-          <div style={{ width: '100%', height: '3px', backgroundColor: '#0d1117', borderRadius: '2px', overflow: 'hidden' }}>
-            <div style={{ width: `${Math.max(0, Math.min(100, 100 - pct))}%`, height: '100%', backgroundColor: bossPctColor(pct) }} />
-          </div>
-        )}
-      </button>
-    );
-  };
-
   return (
     <div style={{
       minHeight: '100vh',
@@ -1220,6 +1142,27 @@ export default function App() {
                   </div>
                 )}
                 <div
+                  onClick={() => { setActiveFeature('argus'); setIsMenuOpen(false); }}
+                  style={{
+                    padding: '10px 12px',
+                    cursor: 'pointer',
+                    borderRadius: '6px',
+                    color: activeFeature === 'argus' ? '#38bdf8' : '#e2e8f0',
+                    backgroundColor: activeFeature === 'argus' ? 'rgba(56, 189, 248, 0.1)' : 'transparent',
+                    transition: 'background-color 0.2s',
+                    fontSize: '14px',
+                    fontWeight: activeFeature === 'argus' ? 600 : 400
+                  }}
+                  onMouseEnter={(e) => {
+                    if (activeFeature !== 'argus') e.currentTarget.style.backgroundColor = '#374151';
+                  }}
+                  onMouseLeave={(e) => {
+                    if (activeFeature !== 'argus') e.currentTarget.style.backgroundColor = 'transparent';
+                  }}
+                >
+                  Contador Manos de Gul'dan
+                </div>
+                <div
                   onClick={() => { setActiveFeature('analyzer'); setIsMenuOpen(false); }}
                   style={{
                     padding: '10px 12px',
@@ -1252,185 +1195,38 @@ export default function App() {
         <AvoidableDamagePanel />
       ) : activeFeature === 'recap' ? (
         <RecapPanel />
+      ) : activeFeature === 'argus' ? (
+        <ArgusCounterView />
       ) : (
         <>
       {/* WarcraftLogs Report Import Card (Only in Analizador view) */}
       {activeFeature === 'analyzer' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '24px', marginBottom: '8px' }}>
-          {/* Input Card */}
-          <div style={{ backgroundColor: '#131720', border: '1px solid #2a2f3e', borderRadius: '12px', padding: '24px', boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.3)' }}>
-            <h2 style={{ color: '#e2e8f0', margin: '0 0 8px 0', fontSize: '18px', fontWeight: 700 }}>Importar Reporte de WarcraftLogs</h2>
-            <p style={{ color: '#64748b', fontSize: '13px', margin: '0 0 16px 0' }}>
-              Pega el link de tu reporte para seleccionar un pull y sincronizar automáticamente el jefe y la dificultad en los filtros de abajo.
-            </p>
-            <div style={{ display: 'flex', gap: '12px' }}>
-              <input 
-                type="text" 
-                value={reportInput}
-                onChange={e => setReportInput(e.target.value)}
-                placeholder="Ej: https://www.warcraftlogs.com/reports/aBcDeFg123"
-                style={{ flex: 1, backgroundColor: '#0d1117', border: '1px solid #374151', color: '#f8fafc', padding: '10px 16px', borderRadius: '6px', fontSize: '14px', outline: 'none' }}
-              />
-              <button 
-                onClick={handleLoadReport}
-                disabled={loadingFights}
-                style={{ 
-                  backgroundColor: '#2563eb', 
-                  color: '#fff', 
-                  border: 'none', 
-                  padding: '10px 24px', 
-                  borderRadius: '6px', 
-                  cursor: loadingFights ? 'not-allowed' : 'pointer', 
-                  fontWeight: 600,
-                  opacity: loadingFights ? 0.7 : 1,
-                  transition: 'background-color 0.2s'
-                }}
-              >
-                {loadingFights ? 'Cargando...' : 'Cargar Reporte'}
-              </button>
-            </div>
-            {reportError && <div style={{ color: '#ef4444', marginTop: '12px', fontSize: '14px' }}>{reportError}</div>}
-          </div>
+          <ReportInputCard
+            value={reportInput}
+            onChange={setReportInput}
+            onLoad={handleLoadReport}
+            loading={loadingFights}
+            error={reportError}
+          />
 
-          {/* Fights List */}
           {fights.length > 0 && (
-            <div style={{ backgroundColor: '#131720', border: '1px solid #2a2f3e', borderRadius: '12px', padding: '24px', boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.3)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '0 0 16px 0' }}>
-                <h2 style={{ color: '#e2e8f0', margin: 0, fontSize: '16px', fontWeight: 700 }}>Selecciona un Pull</h2>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontSize: '13px', cursor: 'pointer', userSelect: 'none' }}>
-                  <input
-                    type="checkbox"
-                    checked={separateWipesByPhase}
-                    onChange={e => setSeparateWipesByPhase(e.target.checked)}
-                    style={{ accentColor: '#3b82f6', width: '14px', height: '14px', cursor: 'pointer' }}
-                  />
-                  Separar wipes por fase
-                </label>
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', maxHeight: '350px', overflowY: 'auto', paddingRight: '8px' }}>
-                {Object.entries(
-                  fights.reduce((acc, fight) => {
-                    const name = fight.name || 'Unknown';
-                    if (!acc[name]) acc[name] = [];
-                    acc[name].push(fight);
-                    return acc;
-                  }, {} as Record<string, ReportFight[]>)
-                ).map(([bossName, bossFights]) => {
-                  // El número de pull es global por jefe (cronológico), aunque se agrupe por fase
-                  const numbered = bossFights.map((fight, index) => ({ fight, pullNumber: index + 1 }));
-                  const hasPhaseData = numbered.some(({ fight }) => fight.lastPhase != null && fight.lastPhase > 0);
-                  const splitByPhase = separateWipesByPhase && hasPhaseData;
-
-                  let phaseGroups: { phaseId: number; entries: typeof numbered }[] = [];
-                  if (splitByPhase) {
-                    const grouped = new Map<number, typeof numbered>();
-                    numbered.forEach(entry => {
-                      const key = entry.fight.lastPhase && entry.fight.lastPhase > 0 ? entry.fight.lastPhase : 0;
-                      if (!grouped.has(key)) grouped.set(key, []);
-                      grouped.get(key)!.push(entry);
-                    });
-                    phaseGroups = [...grouped.entries()]
-                      .map(([phaseId, entries]) => ({ phaseId, entries }))
-                      .sort((a, b) => (a.phaseId === 0 ? Infinity : a.phaseId) - (b.phaseId === 0 ? Infinity : b.phaseId));
-                  }
-
-                  return (
-                    <div key={bossName}>
-                      <h3 style={{ color: '#94a3b8', margin: '0 0 12px 0', fontSize: '13px', borderBottom: '1px solid #2a2f3e', paddingBottom: '8px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                        {bossName}
-                      </h3>
-                      {splitByPhase ? (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                          {phaseGroups.map(group => {
-                            const wipes = group.entries.filter(e => !e.fight.kill).length;
-                            const kills = group.entries.length - wipes;
-                            const totalMs = group.entries.reduce((acc, e) => acc + (e.fight.endTime - e.fight.startTime), 0);
-                            const counts = [
-                              wipes > 0 ? `${wipes} wipe${wipes !== 1 ? 's' : ''}` : '',
-                              kills > 0 ? `${kills} kill${kills !== 1 ? 's' : ''}` : '',
-                            ].filter(Boolean).join(', ');
-                            return (
-                              <div key={group.phaseId}>
-                                <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px', margin: '0 0 8px 0' }}>
-                                  <span style={{ color: '#f8fafc', fontSize: '13px', fontWeight: 700 }}>
-                                    {group.phaseId === 0
-                                      ? 'Sin fase'
-                                      : getPhaseName(group.entries[0].fight.encounterID, group.phaseId)}
-                                  </span>
-                                  <span style={{ color: '#f87171', fontSize: '12px' }}>
-                                    ({counts}, {formatDuration(totalMs)})
-                                  </span>
-                                </div>
-                                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                                  {group.entries.map(({ fight, pullNumber }) => renderPullButton(fight, pullNumber))}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ) : (
-                        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                          {numbered.map(({ fight, pullNumber }) => renderPullButton(fight, pullNumber))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+            <FightsList
+              fights={fights}
+              selectedFightId={selectedFight?.id ?? null}
+              onSelectFight={handleSelectFight}
+              separateWipesByPhase={separateWipesByPhase}
+              onToggleSeparateWipes={setSeparateWipesByPhase}
+              getPhaseName={getPhaseName}
+            />
           )}
 
-          {/* Fight Players List */}
           {selectedFight && (
-            <div style={{ backgroundColor: '#131720', border: '1px solid #2a2f3e', borderRadius: '12px', padding: '24px', boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.3)' }}>
-              <h2 style={{ color: '#e2e8f0', margin: '0 0 8px 0', fontSize: '16px', fontWeight: 700 }}>Integrantes de la Pelea</h2>
-              <p style={{ color: '#64748b', fontSize: '13px', margin: '0 0 16px 0' }}>
-                Haz clic en un jugador para establecer automáticamente su clase y especialización en los filtros de abajo.
-              </p>
-              
-              {loadingPlayers ? (
-                <div style={{ color: '#94a3b8', fontSize: '14px', textAlign: 'center', padding: '16px 0' }}>
-                  Cargando personajes participantes...
-                </div>
-              ) : fightPlayers.length === 0 ? (
-                <div style={{ color: '#64748b', fontSize: '13px', textAlign: 'center', padding: '16px 0' }}>
-                  No se encontraron personajes en este pull.
-                </div>
-              ) : (
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '10px' }}>
-                  {fightPlayers.map(player => (
-                    <button
-                      key={player.id}
-                      onClick={() => handleSelectPlayer(player)}
-                      style={{
-                        backgroundColor: '#1f2937',
-                        border: '1px solid #374151',
-                        borderRadius: '6px',
-                        padding: '10px 12px',
-                        cursor: 'pointer',
-                        textAlign: 'left',
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: '2px',
-                        transition: 'all 0.2s',
-                        outline: 'none'
-                      }}
-                      onMouseEnter={(e) => {
-                        e.currentTarget.style.backgroundColor = '#374151';
-                        e.currentTarget.style.borderColor = player.classColor;
-                      }}
-                      onMouseLeave={(e) => {
-                        e.currentTarget.style.backgroundColor = '#1f2937';
-                        e.currentTarget.style.borderColor = '#374151';
-                      }}
-                    >
-                      <span style={{ color: player.classColor, fontWeight: 700, fontSize: '13px' }}>{player.name}</span>
-                      <span style={{ color: '#94a3b8', fontSize: '11px' }}>{player.specName || player.className}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+            <FightPlayersList
+              players={fightPlayers}
+              loading={loadingPlayers}
+              onSelectPlayer={handleSelectPlayer}
+            />
           )}
         </div>
       )}
@@ -1786,6 +1582,7 @@ export default function App() {
                     </div>
                   </div>
                 ) : (
+                  <>
                   <SpecAnalyzer
                     specModule={getSpecModule(searchedFilters?.className, searchedFilters?.specName)!}
                     encounterName={selectedEncounterName}
@@ -1807,6 +1604,19 @@ export default function App() {
                       }
                     }}
                   />
+                  {/* Contador de Manos de Gul'dan — solo Demonology, y solo cuando
+                      hay un pull analizado del que leer las ventanas de Argus. */}
+                  {searchedFilters?.specName === 'Demonology' && userPullData && (
+                    <div style={{ marginTop: '24px' }}>
+                      <ArgusCounterPanel
+                        windows={userPullData.argus_windows_detail ?? []}
+                        dps={userPullData.dps}
+                        aggregates={userPullData.vs_top20}
+                        playerName={userPullData.player_name}
+                      />
+                    </div>
+                  )}
+                  </>
                 )
               ) : (
                 <div style={{ backgroundColor: '#131720', border: '1px solid #2a2f3e', borderRadius: '12px', padding: '32px', textAlign: 'center', color: '#94a3b8', fontFamily: '"Inter", "Segoe UI", Arial, sans-serif', boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.3)' }}>

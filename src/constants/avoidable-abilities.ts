@@ -27,6 +27,13 @@ export interface EncounterAvoidableConfig {
 }
 
 export const AVOIDABLE_CONFIG: EncounterAvoidableConfig[] = [
+  // ── Season 2 — The Venomous Abyss (12.1) ──────────────────────────────────
+  // Pendiente de curar: Nek'zali the Soulcoiler (3470), Entombed Sentinels (3445),
+  // Vashnik the Malignant (3455), The Lost Explorers (3497), Sszorak (3420),
+  // The Twin Fangs (3421), The Coiled Altar (3429), Ula'tek (3492) y
+  // Nymrissa Wavecaller (3379). Añadir una entrada por boss con sus gameIDs.
+
+  // ── Season 1 — VS / DR / MQD (legacy, ya no seleccionable en filtros) ──────
   {
     encounterId: 3183,
     bossName: 'Midnight Falls', // L'ura

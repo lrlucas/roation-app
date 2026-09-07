@@ -117,3 +117,31 @@ export const POPULAR_REALMS: Record<string, string[]> = {
   TW: ['Wrathbringer', 'Shadowmoon', 'World Tree'],
   CN: ['魔獸'],
 };
+
+// ── Season actual ────────────────────────────────────────────────────────────
+/**
+ * Contenido de la season en curso: Midnight — Season 2 (parche 12.1).
+ *
+ * Los IDs salen de la API de WCL (`worldData.expansion(id: 7).zones`). Se filtra
+ * por ID y no por nombre porque WCL expone zonas homónimas de PTR/Beta y una
+ * zona agregada "Complete Raid" que no sirven para rankings.
+ *
+ * Al cambiar de season solo hay que tocar este bloque: la lista de bosses, las
+ * dificultades y los parches (partitions) se leen dinámicamente de la API.
+ */
+export const CURRENT_SEASON = {
+  /** Partition por defecto de la raid (compactName). Fallback si aún no hay zona cargada. */
+  patch: '12.1',
+  /** The Venomous Abyss (raid de Season 2). */
+  raidZoneId: 53,
+  /** Mythic+ Season 2. */
+  mythicPlusZoneId: 55,
+  /** Último boss de la raid — usado como fallback al resolver caché. */
+  finalBossEncounterId: 3379, // Nymrissa Wavecaller
+} as const;
+
+/** Zonas seleccionables en el panel de filtros (raid + M+ de la season actual). */
+export const ALLOWED_ZONE_IDS: number[] = [
+  CURRENT_SEASON.raidZoneId,
+  CURRENT_SEASON.mythicPlusZoneId,
+];
