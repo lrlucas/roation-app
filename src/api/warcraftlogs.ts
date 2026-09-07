@@ -709,6 +709,71 @@ export async function getReportFights(code: string): Promise<import('../types/wa
   return fights;
 }
 
+/** Rendimiento de un jugador en un pull concreto, según los rankings del reporte. */
+export interface FightPlayerRank {
+  /** DPS con el que WCL rankea el parse. */
+  dps: number;
+  /** Parse global (percentil) sobre todos los parses del boss/dificultad. */
+  rankPercent: number | null;
+  /** Parse dentro del bracket de item level. */
+  bracketPercent: number | null;
+  /** Item level del bracket. */
+  ilvl: number | null;
+  rank: number | null;
+  totalParses: number | null;
+}
+
+/**
+ * Parse y DPS de un jugador en un pull, leídos de `report.rankings`.
+ *
+ * Devuelve null cuando el pull no tiene ranking: WCL solo rankea kills, así que
+ * en wipes (y en contenido no rankeable) no hay parse que mostrar.
+ */
+export async function getFightPlayerRank(
+  code: string,
+  fightID: number,
+  playerName: string,
+): Promise<FightPlayerRank | null> {
+  const data = await gql<{ reportData: { report: { rankings: unknown } } }>(
+    `query GetFightRankings($code: String!, $fightID: Int!) {
+      reportData { report(code: $code) { rankings(fightIDs: [$fightID]) } }
+    }`,
+    { code, fightID },
+  );
+
+  const rankings = data.reportData?.report?.rankings as
+    | { data?: { roles?: Record<string, { characters?: RankedCharacter[] }> }[] }
+    | null;
+  const entry = rankings?.data?.[0];
+  if (!entry?.roles) return null;
+
+  const target = playerName.toLowerCase();
+  for (const role of Object.values(entry.roles)) {
+    const found = role?.characters?.find(c => c.name?.toLowerCase() === target);
+    if (found) {
+      return {
+        dps: found.amount ?? 0,
+        rankPercent: found.rankPercent ?? null,
+        bracketPercent: found.bracketPercent ?? null,
+        ilvl: found.bracketData ?? null,
+        rank: found.rank ?? null,
+        totalParses: found.totalParses ?? null,
+      };
+    }
+  }
+  return null;
+}
+
+interface RankedCharacter {
+  name?: string;
+  amount?: number;
+  rankPercent?: number;
+  bracketPercent?: number;
+  bracketData?: number;
+  rank?: number;
+  totalParses?: number;
+}
+
 export interface FetchPlayerEventsParams {
   code: string;
   fightID: number;

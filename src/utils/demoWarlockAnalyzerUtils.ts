@@ -12,6 +12,11 @@ export interface DemoMetrics {
   tyrant_hog_casts: number;
   tyrant_demons_active: number;
   hand_of_guldan_cast_count: number;
+  argus_windows: number;
+  argus_hog_casts: number;
+  argus_implosion_casts: number;
+  argus_dreadstalkers_casts: number;
+  argus_demons_summoned: number;
   [key: string]: number;
 }
 
@@ -24,12 +29,22 @@ export const DEMO_SPELL_IDS = {
   implosion: 196277,
   shadow_bolt: 686,
   infernal_bolt: 434506,
+  /** Buff de la Apex "Dominion of Argus" (25s). Verificado en log real de S2. */
+  dominion_of_argus: 1276166,
 };
 
 // Pet summon ability ids that count as "demons" for the Tyrant window.
 const WILD_IMP_SUMMONS = [104317, 279910];
 const DREADSTALKER_SUMMONS = [193331, 193332];
 const DEMON_SUMMON_IDS = [...WILD_IMP_SUMMONS, ...DREADSTALKER_SUMMONS];
+
+/** Demonios de talentos de héroe (Diabolist: Overlord / Mother of Chaos / Pit Lord;
+ *  Soul Harvester: Gloomhound; Grimoire: Imp Lord). */
+const HERO_DEMON_SUMMONS = [428571, 428565, 434400, 455465, 1276452];
+/** Demonios que invoca la propia Dominion of Argus (uno por cada 2 Hand of Gul'dan). */
+const ARGUS_DEMON_SUMMONS = [1276283, 1276182, 1282501, 1282502];
+/** El propio Tyrant aparece en el stream de Summons; no es un demonio de la ventana. */
+const TYRANT_SUMMON = 265187;
 
 const SOUL_SHARD_RESOURCE_TYPE = 7; // emits resourcechange with a `waste` field
 const DEMONIC_CORE_MAX = 4;
@@ -52,7 +67,117 @@ const EMPTY: DemoMetrics = {
   tyrant_hog_casts: 0,
   tyrant_demons_active: 0,
   hand_of_guldan_cast_count: 0,
+  argus_windows: 0,
+  argus_hog_casts: 0,
+  argus_implosion_casts: 0,
+  argus_dreadstalkers_casts: 0,
+  argus_demons_summoned: 0,
 };
+
+/** Desglose de demonios invocados dentro de una ventana de Dominion of Argus. */
+export interface ArgusWindowDemons {
+  wildImps: number;
+  dreadstalkers: number;
+  /** Diabolist / Soul Harvester / Grimoire. */
+  hero: number;
+  /** Los que invoca la propia Dominion of Argus. */
+  argus: number;
+  /** Summons no catalogados (IDs nuevos de un parche futuro): se cuentan igual. */
+  other: number;
+  total: number;
+}
+
+/** Una ventana del buff Dominion of Argus con todo lo ocurrido dentro. */
+export interface ArgusWindow {
+  /** 1-indexado, en orden cronológico. */
+  index: number;
+  /** Inicio relativo al comienzo de la pelea, en ms. */
+  startOffsetMs: number;
+  durationMs: number;
+  /** True si la ventana seguía activa al acabar la pelea (o ya activa al empezar). */
+  truncated: boolean;
+  handOfGuldan: number;
+  implosion: number;
+  callDreadstalkers: number;
+  demons: ArgusWindowDemons;
+}
+
+function classifySummon(abilityGameID: number): keyof Omit<ArgusWindowDemons, 'total'> | null {
+  if (abilityGameID === TYRANT_SUMMON) return null; // el propio Tyrant no cuenta
+  if (WILD_IMP_SUMMONS.includes(abilityGameID)) return 'wildImps';
+  if (DREADSTALKER_SUMMONS.includes(abilityGameID)) return 'dreadstalkers';
+  if (HERO_DEMON_SUMMONS.includes(abilityGameID)) return 'hero';
+  if (ARGUS_DEMON_SUMMONS.includes(abilityGameID)) return 'argus';
+  return 'other';
+}
+
+/**
+ * Ventanas del buff Dominion of Argus (Apex, 25s) con el conteo de Hand of Gul'dan,
+ * Implosion, Call Dreadstalkers y demonios invocados dentro de cada una.
+ *
+ * La ventana se lee del propio buff (applybuff → removebuff) en vez de estimarse
+ * desde el cast, así que refleja la duración real incluidas extensiones o cortes
+ * por muerte. Un warlock sin la Apex simplemente no tiene el buff → array vacío.
+ */
+export function analyzeArgusWindows(
+  events: CombinedEvents,
+  fightStartTime: number,
+  fightEndTime: number,
+): ArgusWindow[] {
+  const buffs = (events.buffs || [])
+    .filter(e => e.abilityGameID === DEMO_SPELL_IDS.dominion_of_argus)
+    .sort((a, b) => a.timestamp - b.timestamp);
+  if (buffs.length === 0) return [];
+
+  // 1) Delimitar ventanas. Los eventos de stack (applybuffstack/removebuffstack)
+  //    ocurren dentro de una ventana ya abierta y no la abren ni la cierran.
+  const ranges: { start: number; end: number; truncated: boolean }[] = [];
+  let open: { start: number; truncated: boolean } | null = null;
+  for (const e of buffs) {
+    if (e.type === 'applybuff' || e.type === 'refreshbuff') {
+      if (!open) open = { start: e.timestamp, truncated: false };
+    } else if (e.type === 'removebuff') {
+      // removebuff sin applybuff previo ⇒ el buff ya estaba activo al empezar la pelea.
+      const start = open ? open.start : fightStartTime;
+      ranges.push({ start, end: e.timestamp, truncated: !open });
+      open = null;
+    }
+  }
+  // Ventana aún activa al acabar la pelea (wipe o kill dentro de la ventana).
+  if (open) ranges.push({ start: open.start, end: fightEndTime, truncated: true });
+
+  // 2) Contar lo que cae dentro de cada ventana.
+  const casts = (events.casts || []).filter(e => e.type === 'cast');
+  const summons = events.summons || [];
+
+  return ranges.map((r, i) => {
+    const inRange = (ts: number) => ts >= r.start && ts <= r.end;
+    const countCasts = (id: number) =>
+      casts.filter(c => c.abilityGameID === id && inRange(c.timestamp)).length;
+
+    const demons: ArgusWindowDemons = {
+      wildImps: 0, dreadstalkers: 0, hero: 0, argus: 0, other: 0, total: 0,
+    };
+    for (const s of summons) {
+      if (!inRange(s.timestamp)) continue;
+      const bucket = classifySummon(s.abilityGameID);
+      if (!bucket) continue;
+      demons[bucket]++;
+      demons.total++;
+    }
+
+    return {
+      index: i + 1,
+      startOffsetMs: Math.max(0, r.start - fightStartTime),
+      durationMs: Math.max(0, r.end - r.start),
+      truncated: r.truncated,
+      handOfGuldan: countCasts(DEMO_SPELL_IDS.hand_of_guldan),
+      implosion: countCasts(DEMO_SPELL_IDS.implosion),
+      callDreadstalkers: countCasts(DEMO_SPELL_IDS.call_dreadstalkers),
+      demons,
+    };
+  });
+}
 
 export function analyzeDemoMetrics(
   events: CombinedEvents,
@@ -184,6 +309,16 @@ export function analyzeDemoMetrics(
     ? Number((demonsInWindows / tyrantCasts.length).toFixed(1))
     : 0;
 
+  // 8. Ventanas de Dominion of Argus (Apex, 25s). Las métricas son promedios por
+  // ventana para que sean comparables entre peleas de distinta duración; quedan a 0
+  // cuando el jugador no lleva la Apex (marcadas como "sin datos" en la UI).
+  const argusWindows = analyzeArgusWindows(events, fightStartTime, fightEndTime);
+  const argus_windows = argusWindows.length;
+  const perWindow = (total: number) =>
+    argus_windows > 0 ? Number((total / argus_windows).toFixed(1)) : 0;
+  const sum = (pick: (w: ArgusWindow) => number) =>
+    argusWindows.reduce((acc, w) => acc + pick(w), 0);
+
   return {
     ability_uptime,
     soul_shard_overcap,
@@ -194,5 +329,10 @@ export function analyzeDemoMetrics(
     tyrant_hog_casts,
     tyrant_demons_active,
     hand_of_guldan_cast_count,
+    argus_windows,
+    argus_hog_casts: perWindow(sum(w => w.handOfGuldan)),
+    argus_implosion_casts: perWindow(sum(w => w.implosion)),
+    argus_dreadstalkers_casts: perWindow(sum(w => w.callDreadstalkers)),
+    argus_demons_summoned: perWindow(sum(w => w.demons.total)),
   };
 }

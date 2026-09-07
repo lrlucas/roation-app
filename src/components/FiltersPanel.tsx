@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { getExpansions, getZones } from '../api/warcraftlogs';
-import { WOW_CLASSES, REGIONS } from '../data/wowData';
+import { WOW_CLASSES, REGIONS, CURRENT_SEASON, ALLOWED_ZONE_IDS } from '../data/wowData';
 import REALM_DATA from '../data/realms.json';
 import type { Expansion, Zone, FilterState } from '../types/warcraftlogs';
 
@@ -164,11 +164,11 @@ export default function FiltersPanel({
     setApiError(null);
     getZones(filters.expansionId)
       .then(data => {
-        const allowedZones = ['VS / DR / MQD', 'Mythic+ Season 1'];
-        const filtered = data.filter(z => allowedZones.includes(z.name));
+        // Season 2 de Midnight: The Venomous Abyss + Mythic+ Season 2.
+        const filtered = data.filter(z => ALLOWED_ZONE_IDS.includes(z.id));
         setZones(filtered);
-        
-        const defaultZone = filtered.find(z => z.name === 'VS / DR / MQD');
+
+        const defaultZone = filtered.find(z => z.id === CURRENT_SEASON.raidZoneId);
         if (defaultZone) {
           const diff = defaultZone.difficulties.at(-1)?.id ?? null;
           setFilters(prev => ({ ...prev, zoneId: defaultZone.id, encounterId: null, difficulty: diff }));
