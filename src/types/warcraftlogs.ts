@@ -71,6 +71,8 @@ export interface RankingEntry {
   report: { code: string; fightID: number };
   server: { name: string; region: string };
   guild?: { name: string; id: number; faction: number } | null;
+  /** Solo presente si se pidió includeCombatantInfo. talentID = id de entrada del árbol, no spell id. */
+  talents?: { talentID: number; points: number }[];
 }
 
 export interface RankingsData {
