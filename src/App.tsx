@@ -15,6 +15,7 @@ import AvoidableDamagePanel from './components/AvoidableDamagePanel';
 import RecapPanel from './components/RecapPanel';
 import ArgusCounterPanel from './components/ArgusCounterPanel';
 import ArgusCounterView from './components/ArgusCounterView';
+import UnholyDkPanel from './components/UnholyDkPanel';
 import { ReportInputCard, FightsList, FightPlayersList } from './components/ReportPicker';
 import { fetchFightPlayers } from './utils/reportPlayers';
 import type { FightPlayer } from './utils/reportPlayers';
@@ -108,7 +109,7 @@ export default function App() {
   const isBurstEnabled = import.meta.env.VITE_FEATURE_BURST === 'true';
   const isAvoidableEnabled = import.meta.env.VITE_FEATURE_AVOIDABLE === 'true';
   const isRecapEnabled = import.meta.env.VITE_FEATURE_RECAP === 'true';
-  const [activeFeature, setActiveFeature] = useState<'rotation' | 'burst' | 'analyzer' | 'avoidable' | 'recap' | 'argus'>(isRotationEnabled ? 'rotation' : 'burst');
+  const [activeFeature, setActiveFeature] = useState<'rotation' | 'burst' | 'analyzer' | 'avoidable' | 'recap' | 'argus' | 'unholy'>(isRotationEnabled ? 'rotation' : 'burst');
   const [selectedEncounterName, setSelectedEncounterName] = useState('');
   const [selectedDifficultyName, setSelectedDifficultyName] = useState('');
   const [searchedFilters, setSearchedFilters] = useState<FilterState | null>(null);
@@ -1163,6 +1164,27 @@ export default function App() {
                   Contador Manos de Gul'dan
                 </div>
                 <div
+                  onClick={() => { setActiveFeature('unholy'); setIsMenuOpen(false); }}
+                  style={{
+                    padding: '10px 12px',
+                    cursor: 'pointer',
+                    borderRadius: '6px',
+                    color: activeFeature === 'unholy' ? '#38bdf8' : '#e2e8f0',
+                    backgroundColor: activeFeature === 'unholy' ? 'rgba(56, 189, 248, 0.1)' : 'transparent',
+                    transition: 'background-color 0.2s',
+                    fontSize: '14px',
+                    fontWeight: activeFeature === 'unholy' ? 600 : 400
+                  }}
+                  onMouseEnter={(e) => {
+                    if (activeFeature !== 'unholy') e.currentTarget.style.backgroundColor = '#374151';
+                  }}
+                  onMouseLeave={(e) => {
+                    if (activeFeature !== 'unholy') e.currentTarget.style.backgroundColor = 'transparent';
+                  }}
+                >
+                  DK Unholy
+                </div>
+                <div
                   onClick={() => { setActiveFeature('analyzer'); setIsMenuOpen(false); }}
                   style={{
                     padding: '10px 12px',
@@ -1197,6 +1219,8 @@ export default function App() {
         <RecapPanel />
       ) : activeFeature === 'argus' ? (
         <ArgusCounterView />
+      ) : activeFeature === 'unholy' ? (
+        <UnholyDkPanel />
       ) : (
         <>
       {/* WarcraftLogs Report Import Card (Only in Analizador view) */}

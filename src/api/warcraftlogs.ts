@@ -135,6 +135,8 @@ export interface GetRankingsParams {
   /** WCL partition id (per patch). Resolved dynamically from the zone's
    *  partitions; omit to use WCL's default (latest) partition. */
   partition?:  number | null;
+  /** Incluye talents/gear de cada parse (necesario para filtrar por hero talent). */
+  includeCombatantInfo?: boolean;
 }
 
 export async function getRankings(params: GetRankingsParams): Promise<RankingsData> {
@@ -151,6 +153,7 @@ export async function getRankings(params: GetRankingsParams): Promise<RankingsDa
       $serverSlug:  String
       $page:        Int
       $partition:   Int
+      $includeCombatantInfo: Boolean
     ) {
       worldData {
         encounter(id: $encounterId) {
@@ -162,6 +165,7 @@ export async function getRankings(params: GetRankingsParams): Promise<RankingsDa
             serverSlug:   $serverSlug
             page:         $page
             partition:    $partition
+            includeCombatantInfo: $includeCombatantInfo
           )
         }
       }
@@ -176,6 +180,7 @@ export async function getRankings(params: GetRankingsParams): Promise<RankingsDa
     page:         params.page ?? 1,
     // Pass the partition id straight through; null/undefined → WCL default (latest patch).
     partition:    params.partition ?? undefined,
+    includeCombatantInfo: params.includeCombatantInfo ?? false,
   });
 
   return data.worldData.encounter.characterRankings as RankingsData;
@@ -772,6 +777,53 @@ interface RankedCharacter {
   bracketData?: number;
   rank?: number;
   totalParses?: number;
+}
+
+// ── Blightfall (DK Unholy) ─────────────────────────────────────────────────────
+
+export interface PlayerAbilityEventsResponse {
+  fightStartTime: number;
+  fightEndTime: number;
+  actorId: number;
+  events: any[];
+}
+
+/**
+ * Eventos de un jugador en un fight filtrados a un set de habilidades
+ * (casts, debuffs y daño, incluidos ticks). Se usa para analizar Blightfall
+ * sin bajar el log completo del jugador.
+ */
+export async function fetchPlayerAbilityEvents(
+  code: string,
+  fightID: number,
+  playerName: string,
+  abilityIds: number[],
+): Promise<PlayerAbilityEventsResponse> {
+  const data = await gql<any>(`
+    query GetFightActors($code: String!, $fightID: Int!) {
+      reportData {
+        report(code: $code) {
+          fights(fightIDs: [$fightID]) { id startTime endTime }
+          masterData { actors(type: "Player") { id name } }
+        }
+      }
+    }
+  `, { code, fightID });
+
+  const report = data.reportData?.report;
+  const fight = report?.fights?.[0];
+  if (!fight) throw new Error(`Fight ${fightID} no encontrado en ${code}`);
+  const actor = (report.masterData?.actors || []).find((a: any) => a.name === playerName);
+  if (!actor) throw new Error(`${playerName} no encontrado en ${code}`);
+
+  const filter = `ability.id in (${abilityIds.join(',')})`;
+  const events = await fetchRemainingPages(
+    code, fightID, 'All',
+    `sourceID: ${actor.id}, filterExpression: ${JSON.stringify(filter)}`,
+    fight.startTime, fight.endTime,
+  );
+
+  return { fightStartTime: fight.startTime, fightEndTime: fight.endTime, actorId: actor.id, events };
 }
 
 export interface FetchPlayerEventsParams {

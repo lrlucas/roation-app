@@ -12,6 +12,8 @@ interface FiltersPanelProps {
   preselectedClassName?: string | null;
   preselectedSpecName?: string | null;
   onLoadEncounters?: (encounters: { id: number; name: string }[]) => void;
+  /** Bloquea los selects de clase/spec (vistas dedicadas a una spec). */
+  lockClassSpec?: boolean;
 }
 
 // ── Styles ──────────────────────────────────────────────────────────────────
@@ -110,7 +112,8 @@ export default function FiltersPanel({
   preselectedDifficultyId = null,
   preselectedClassName = null,
   preselectedSpecName = null,
-  onLoadEncounters
+  onLoadEncounters,
+  lockClassSpec = false,
 }: FiltersPanelProps) {
   // Remote data
   const [expansions,      setExpansions]      = useState<Expansion[]>([]);
@@ -340,7 +343,7 @@ export default function FiltersPanel({
         {/* Class */}
         <div>
           <label style={LABEL}>Class</label>
-          <select style={SELECT} value={filters.className} onChange={handleClass}>
+          <select style={lockClassSpec ? DISABLED_SELECT : SELECT} value={filters.className} onChange={handleClass} disabled={lockClassSpec}>
             {WOW_CLASSES.map(cls => (
               <option key={cls.slug} value={cls.slug}>{cls.name}</option>
             ))}
@@ -351,9 +354,10 @@ export default function FiltersPanel({
         <div>
           <label style={LABEL}>Specialization</label>
           <select
-            style={SELECT}
+            style={lockClassSpec ? DISABLED_SELECT : SELECT}
             value={filters.specName}
             onChange={e => set('specName', e.target.value)}
+            disabled={lockClassSpec}
           >
             {selectedClass.specs.map(sp => (
               <option key={sp.slug} value={sp.slug}>{sp.name}</option>
